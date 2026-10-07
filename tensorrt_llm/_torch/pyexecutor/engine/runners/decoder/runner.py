@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._profiler import MetadataValue, record_function_with_metadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -121,6 +122,19 @@ from .speculative import (
     set_spec_metadata_all_rank_num_tokens,
     update_spec_metadata,
 )
+
+
+def _model_forward_workflow_metadata(
+    runner: "DecoderRunner", *, is_dummy: bool, **kwargs: Any
+) -> dict[str, MetadataValue]:
+    """Observe physical input rows at the model call, including padded rows."""
+    fields: dict[str, MetadataValue] = {
+        "workflow.executor.is_warmup": is_dummy,
+    }
+    input_ids = kwargs.get("input_ids")
+    if isinstance(input_ids, torch.Tensor):
+        fields["workflow.model.input_token_rows"] = input_ids.shape[0]
+    return fields
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> int:
@@ -4582,6 +4596,7 @@ class DecoderRunner(ScheduledModelRunner):
         return inputs, gather_ids_device, runtime_draft_len
 
     @nvtx_range("_prepare_inputs")
+    @record_function_with_metadata("trtllm::prepare_inputs")
     def _prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
@@ -5006,6 +5021,9 @@ class DecoderRunner(ScheduledModelRunner):
         with self.model.model.bypass():
             yield
 
+    @record_function_with_metadata(
+        "trtllm::model_forward", metadata_factory=_model_forward_workflow_metadata
+    )
     def model_forward(self, *, is_dummy: bool, **kwargs):
         assert self._model_caller is not None
         reclaimer = self._eager_workspace_reclaimer
